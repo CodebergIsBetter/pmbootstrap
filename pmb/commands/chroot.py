@@ -11,6 +11,7 @@ import pmb.install.blockdevice
 from pmb.core import Chroot, ChrootType
 from pmb.helpers import logging
 from pmb.helpers.exceptions import CommandFailedError, NonBugError
+from pmb.parse.deviceinfo import device_is_alpine_only
 from pmb.types import Env, RunOutputTypeDefault
 
 
@@ -71,7 +72,14 @@ def chroot(
         for folder in pmb.config.flash_mount_bind:
             pmb.helpers.mount.bind(folder, Chroot.native() / folder)
 
-    pmb.helpers.apk.update_repository_list(chroot.path, user_repository=True)
+    alpine_only = chroot.type in [
+        ChrootType.ROOTFS,
+        ChrootType.INSTALLER,
+        ChrootType.IMAGE,
+    ] and device_is_alpine_only(chroot.name)
+    pmb.helpers.apk.update_repository_list(
+        chroot.path, user_repository=True, alpine_only=alpine_only
+    )
 
     try:
         # Run the command as user/root
