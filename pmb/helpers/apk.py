@@ -21,12 +21,15 @@ from pmb.types import PathString, RunOutputTypePopen
 def update_repository_list(
     root: Path,
     user_repository: bool = False,
+    alpine_only: bool = False,
 ) -> None:
     """
     Update /etc/apk/repositories, if it is outdated (when the user changed the
     --mirror-alpine or --mirror-pmOS parameters).
 
     :param root: the root directory to operate on
+    :param alpine_only: only write Alpine's mirrors, for devices that set
+                        deviceinfo_alpine_only
     """
     # Read old entries or create folder structure
     path = root / "etc/apk/repositories"
@@ -43,7 +46,9 @@ def update_repository_list(
     user_repo_dir = Path("/mnt/pmbootstrap/packages") if user_repository else None
 
     # Up to date: Save cache, return
-    lines_new = pmb.helpers.repo.get_repos_from_config(user_repository=user_repo_dir)
+    lines_new = pmb.helpers.repo.get_repos_from_config(
+        user_repository=user_repo_dir, alpine_only=alpine_only
+    )
     if lines_old == lines_new:
         return
 
