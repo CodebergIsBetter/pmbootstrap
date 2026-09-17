@@ -24,6 +24,7 @@ from pmb.core.context import Context, get_context
 from pmb.core.pkgrepo import pkgrepo_relative_path
 from pmb.helpers import logging
 from pmb.helpers.exceptions import BuildFailedError, CommandFailedError, NonBugError
+from pmb.parse.deviceinfo import device_is_alpine_only
 from pmb.types import CrossCompile
 
 from .backend import BootstrapStage, run_abuild
@@ -68,7 +69,20 @@ def check_build_for_arch(pkgname: str, arch: Arch) -> bool:
     raise RuntimeError(f"Can't build '{pkgname}' for architecture {arch}")
 
 
-def get_depends(context: Context, apkbuild: Apkbuild) -> list[str]:
+def alpine_only_arch() -> Arch | None:
+    """
+    :returns: the architecture of the configured device, if that device is
+              installed from Alpine's repositories only (deviceinfo_alpine_only),
+              None otherwise
+    """
+    if not device_is_alpine_only():
+        return None
+    return pmb.parse.deviceinfo().arch
+
+
+def get_depends(
+    context: Context, apkbuild: Apkbuild, ignore_depends: bool | None = None
+) -> list[str]:
     """
     Alpine's abuild always builds/installs the "depends" and "makedepends" of a package
     before building it.
@@ -76,8 +90,12 @@ def get_depends(context: Context, apkbuild: Apkbuild) -> list[str]:
     We used to only care about "makedepends"
     and it's still possible to ignore the depends with --ignore-depends.
 
+    :param ignore_depends: override context.ignore_depends
     :returns: list of dependency pkgnames (eg. ["sdl2", "sdl2_net"])
     """
+    if ignore_depends is None:
+        ignore_depends = context.ignore_depends
+
     # Read makedepends and depends
     if apkbuild["makedepends"]:
         ret = list(apkbuild["makedepends"])
@@ -85,7 +103,7 @@ def get_depends(context: Context, apkbuild: Apkbuild) -> list[str]:
         ret = list(apkbuild["makedepends_build"]) + list(apkbuild["makedepends_host"])
     if "!check" not in apkbuild["options"]:
         ret += apkbuild["checkdepends"]
-    if not context.ignore_depends:
+    if not ignore_depends:
         ret += apkbuild["depends"]
     ret = sorted(set(ret))
 
@@ -348,13 +366,36 @@ def process_package(
     if arch is None:
         arch = pmb.build.autodetect.arch(base_apkbuild)
 
+    # deviceinfo_alpine_only: the device package is the only thing that may come
+    # from pmaports, everything else must be an Alpine binary package. Without
+    # this, pmaports packages win over their Alpine counterparts through
+    # provides=, e.g. postmarketos-base has provides="alpine-base=1000-r0" and
+    # postmarketos-mkinitfs provides mkinitfs, which would pull the whole
+    # postmarketOS base system into a supposedly Alpine-only rootfs.
+    if arch == alpine_only_arch():
+        device_pkgname = f"device-{get_context().config.device}"
+        if base_apkbuild["pkgname"] != device_pkgname:
+            logging.info(
+                f"NOTE: not building {base_apkbuild['pkgname']} from pmaports for {pkgname},"
+                " the device is installed from Alpine only (deviceinfo_alpine_only)"
+            )
+            return []
+
     if is_cached_or_cache(arch, pkgname) and not force:
         logging.verbose(f"S{arch}/{pkgname}: already queued")
         return []
 
+    # Runtime dependencies of a device that is installed from Alpine only must
+    # be satisfied by Alpine's binary repository, never built from pmaports:
+    # pmaports carries forks (temp/eudev) and providers (postmarketos-mkinitfs
+    # provides mkinitfs) that would otherwise be preferred and would drag in
+    # the entire postmarketOS base system. Build-time dependencies are
+    # unaffected, they never end up in the image.
+    ignore_depends = context.ignore_depends or arch == alpine_only_arch()
+
     logging.debug(f"{arch}/{pkgname}: Generating dependency tree")
     # Add the package to the build queue
-    base_depends = get_depends(context, base_apkbuild)
+    base_depends = get_depends(context, base_apkbuild, ignore_depends)
 
     depends = base_depends.copy()
 
@@ -397,7 +438,7 @@ def process_package(
         cross = pmb.build.autodetect.crosscompile(apkbuild, arch)
         bstatus = pmb.build.get_status(arch, apkbuild)
         if bstatus.necessary() and dep not in pmb.config.build_packages:
-            deps = get_depends(context, apkbuild)
+            deps = get_depends(context, apkbuild, ignore_depends)
             logging.debug(
                 f"BUILDQUEUE: queue {dep} (dependency of {parent}) for build, reason: {bstatus}"
             )
