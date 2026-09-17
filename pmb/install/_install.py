@@ -4,6 +4,7 @@ import glob
 import os
 import re
 import shlex
+import string
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -17,6 +18,7 @@ import pmb.config.pmaports
 import pmb.helpers.devices
 import pmb.helpers.other
 import pmb.helpers.run
+import pmb.helpers.ui
 import pmb.install
 import pmb.install.blockdevice
 import pmb.install.recovery
@@ -173,6 +175,260 @@ def create_home_from_skel(filesystem: str, user: str) -> None:
     pmb.helpers.run.root(["chown", "-R", "10000", home])
 
 
+def write_cmdline_txt(
+    layout: PartitionLayout | None,
+    chroot: Chroot,
+    filesystem: str,
+    full_disk_encryption: bool,
+) -> None:
+    """
+    Write /boot/cmdline.txt for devices that are installed from Alpine only.
+
+    On a regular postmarketOS install this is done by boot-deploy (which reads
+    deviceinfo_generate_cmdline_txt), but boot-deploy is a postmarketOS package
+    that alpine_only devices don't install. The kernel command line is
+    assembled the same way boot-deploy does it: the fragments that device
+    packages drop into /usr/lib/kernel-cmdline.d/, plus deviceinfo_kernel_cmdline,
+    plus the root device that we only know after partitioning.
+
+    :param layout: partition layout from get_partition_layout() or None
+    """
+    root_dev = Path(f"/dev/installp{layout['root']}") if layout else Path("/dev/install")
+    root = "/dev/mapper/root" if full_disk_encryption else f"UUID={get_uuid(root_dev)}"
+
+    args: list[str] = []
+    cmdline_d = chroot / "usr/lib/kernel-cmdline.d"
+    if cmdline_d.exists():
+        for fragment in sorted(cmdline_d.glob("*.conf")):
+            args += fragment.read_text().split()
+
+    deviceinfo = pmb.parse.deviceinfo()
+    if deviceinfo.kernel_cmdline:
+        args += deviceinfo.kernel_cmdline.split()
+
+    args += [f"root={root}", f"rootfstype={pmb.install.get_root_filesystem(filesystem)}", "rw"]
+
+    cmdline = " ".join(args) + "\n"
+    logging.info(f"({chroot}) write /boot/cmdline.txt")
+    logging.debug(f"cmdline.txt: {cmdline.strip()}")
+    (chroot / "tmp/cmdline.txt").write_text(cmdline)
+    pmb.chroot.root(["mv", "/tmp/cmdline.txt", "/boot/cmdline.txt"], chroot)
+    # The file was created by the (non-root) pmbootstrap process, so it is owned
+    # by the host user. Copying that onto a FAT boot partition fails with
+    # "cp: can't preserve ownership of ...: Operation not permitted".
+    pmb.chroot.root(["chown", "root:root", "/boot/cmdline.txt"], chroot)
+    pmb.chroot.root(["chmod", "644", "/boot/cmdline.txt"], chroot)
+
+
+def setup_tinydm(chroot: Chroot, ui: str, user: str) -> None:
+    """
+    Autostart the selected UI with tinydm, for devices that set
+    deviceinfo_alpine_only.
+
+    On a regular postmarketOS install the postmarketos-ui-* package does this in
+    its post-install script. Those packages depend on postmarketos-base-ui and
+    can therefore not be used here, so pmbootstrap wires up the Alpine
+    equivalent itself.
+
+    :param ui: the selected UI, which is an Alpine package name here
+    :param user: user to log in automatically
+    """
+    # Both directories are searched because the UI may be an X11 one
+    sessions = pmb.chroot.root(
+        [
+            "sh",
+            "-c",
+            (
+                "for f in /usr/share/wayland-sessions/*.desktop"
+                " /usr/share/xsessions/*.desktop; do"
+                ' [ -e "$f" ] && echo "$f"; done'
+            ),
+        ],
+        chroot,
+        output_return=True,
+        check=False,
+    ).split()
+
+    if not sessions:
+        logging.warning(
+            f"WARNING: {ui} does not install a session file in /usr/share/wayland-sessions"
+            " or /usr/share/xsessions, so it will not be started automatically."
+            " Start it by hand after logging in."
+        )
+        return
+
+    # Several packages ship a session file that is not named after the package,
+    # and some ship both an X11 and a Wayland one, so the table can name the
+    # right one explicitly. Fall back to matching the UI name, then to the
+    # first file found.
+    wanted = pmb.helpers.ui.alpine_ui_session(ui)
+    session = ""
+    if wanted:
+        session = next((s for s in sessions if Path(s).name == wanted), "")
+        if not session:
+            logging.warning(
+                f"WARNING: {ui} was expected to install {wanted}, but it did not."
+                " Falling back to whichever session file is present."
+            )
+    if not session:
+        session = next((s for s in sessions if Path(s).stem == ui), sessions[0])
+
+    if "/xsessions/" in session:
+        # tinydm-run-session needs xinit to start an X11 session
+        pmb.chroot.apk.install(["tinydm-x11"], chroot)
+
+        # Alpine's Xorg is the setuid Xorg.wrap, which drops root when every
+        # DRM card is a KMS device - which is the case on a board whose only
+        # GPU is a KMS driver. Unprivileged Xorg then cannot open the VT,
+        # because autologin does not chown it to the user, and dies with
+        # "xf86OpenConsole: Cannot open virtual console". Alpine's Xorg has no
+        # logind support compiled in, so keeping root is the only option.
+        # postmarketos-base-ui ships the identical one-line file.
+        pmb.chroot.root(["mkdir", "-p", "/etc/X11"], chroot)
+        pmb.chroot.root(
+            ["sh", "-c", "echo needs_root_rights=yes > /etc/X11/Xwrapper.config"], chroot
+        )
+
+    logging.info(f"({chroot}) autostart {Path(session).stem} with tinydm")
+    pmb.chroot.root(["tinydm-set-session", "-f", "-s", session], chroot)
+    pmb.chroot.root(["rc-update", "add", "tinydm", "default"], chroot, check=False)
+
+    # tinydm autologins AUTOLOGIN_UID, which defaults to 1000. set_user()
+    # creates the user with a different UID, so point tinydm at the real one.
+    uid = pmb.chroot.root(["id", "-u", user], chroot, output_return=True).strip()
+    conf = "/etc/conf.d/tinydm"
+    pmb.chroot.root(
+        [
+            "sh",
+            "-c",
+            (
+                f"if grep -q '^AUTOLOGIN_UID=' {conf}; then"
+                f" sed -i 's/^AUTOLOGIN_UID=.*/AUTOLOGIN_UID={uid}/' {conf};"
+                f" else echo 'AUTOLOGIN_UID={uid}' >> {conf}; fi"
+            ),
+        ],
+        chroot,
+    )
+
+    # tinydm's own init script only declares 'want dbus elogind'. There is no
+    # elogind here, and nothing orders it after seatd, so both land in the
+    # default runlevel unordered and the compositor can start before seatd is
+    # listening. Express the real dependency with OpenRC's rc_need override.
+    pmb.chroot.root(
+        [
+            "sh",
+            "-c",
+            (
+                f"if grep -q '^rc_need=' {conf}; then"
+                f" sed -i 's/^rc_need=.*/rc_need=\"seatd dbus\"/' {conf};"
+                f" else echo 'rc_need=\"seatd dbus\"' >> {conf}; fi"
+            ),
+        ],
+        chroot,
+    )
+
+    # A wayland compositor needs to talk to seatd, and to reach /dev/dri and
+    # /dev/input. The device package enables seatd itself.
+    #
+    # pipewire: Alpine's pipewire package ships
+    # /etc/security/limits.d/25-pw-rlimits.conf, which grants rtprio, nice and
+    # memlock to members of a "pipewire" group that is created empty. pam_limits
+    # is already in the session stack, so without adding the user the limits
+    # match nobody: the data thread runs SCHED_OTHER at nice 0 on a
+    # single-core ARM1176 that is also compositing, logs "Can't set realtime
+    # priority", and audio crackles under any load.
+    for group in ["seat", "video", "input", "pipewire"]:
+        pmb.chroot.root(["addgroup", user, group], chroot, check=False)
+
+
+def setup_wifi(chroot: Chroot, ssid: str, psk: str | None, country: str = "US") -> None:
+    """
+    Write /etc/wpa_supplicant/wpa_supplicant.conf, so that a headless device
+    joins a Wi-Fi network on the very first boot and can be reached over SSH
+    without ever attaching a screen.
+
+    :param ssid: name of the network
+    :param psk: passphrase (8-63 characters) or a 64 character hex PSK. None or
+                empty for an open network.
+    """
+    if not pmb.parse.deviceinfo().alpine_only:
+        raise NonBugError(
+            "--wifi-ssid is only implemented for devices with deviceinfo_alpine_only."
+            " Other devices use NetworkManager, which ignores wpa_supplicant.conf."
+        )
+
+    # The value goes into a quoted string in a config file, so refuse anything
+    # that could break out of it
+    if '"' in ssid or "\\" in ssid or "\n" in ssid:
+        raise NonBugError(f"--wifi-ssid must not contain a quote or a backslash: {ssid}")
+
+    if not psk:
+        logging.warning(
+            f"WARNING: no passphrase for '{ssid}', configuring it as an open network."
+            " If that network is in fact encrypted, the device will not be able to join it."
+        )
+        network = f'network={{\n\tssid="{ssid}"\n\tkey_mgmt=NONE\n\tscan_ssid=1\n}}\n'
+    elif len(psk) == 64 and all(c in string.hexdigits for c in psk):
+        network = f'network={{\n\tssid="{ssid}"\n\tpsk={psk}\n\tscan_ssid=1\n}}\n'
+    else:
+        if not 8 <= len(psk) <= 63:
+            raise NonBugError(
+                "--wifi-psk must be a passphrase of 8 to 63 characters, or a 64 character"
+                f" hex PSK (got {len(psk)} characters)"
+            )
+        # Hash it, so the plaintext passphrase does not end up in the image.
+        # wpa_passphrase prints a whole network block, but it also repeats the
+        # plaintext in a "#psk=" comment, so take only the hash out of it.
+        out = pmb.chroot.root(["wpa_passphrase", ssid, psk], chroot, output_return=True)
+        psk_hash = ""
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("psk="):
+                psk_hash = line[len("psk=") :]
+                break
+        if not psk_hash:
+            raise RuntimeError(f"wpa_passphrase did not return a PSK:\n{out}")
+        network = f'network={{\n\tssid="{ssid}"\n\tpsk={psk_hash}\n\tscan_ssid=1\n}}\n'
+
+    if not re.fullmatch(r"[A-Za-z]{2}", country or ""):
+        raise NonBugError(f"--wifi-country must be a two letter ISO 3166-1 code, got: {country}")
+
+    config = (
+        "# Generated by pmbootstrap. Edit /boot/wpa_supplicant.conf on the FAT\n"
+        "# boot partition to change the network without reflashing.\n"
+        f"country={country.upper()}\n"
+        "ctrl_interface=/var/run/wpa_supplicant\n"
+        "ctrl_interface_group=wheel\n"
+        "update_config=1\n\n" + network
+    )
+
+    logging.info(f"({chroot}) configure wifi network '{ssid}'")
+    (chroot / "tmp/wpa_supplicant.conf").write_text(config)
+    pmb.chroot.root(["mkdir", "-p", "/etc/wpa_supplicant"], chroot)
+    pmb.chroot.root(
+        [
+            "install",
+            "-Dm600",
+            "/tmp/wpa_supplicant.conf",
+            "/etc/wpa_supplicant/wpa_supplicant.conf",
+        ],
+        chroot,
+    )
+    pmb.chroot.root(["rm", "/tmp/wpa_supplicant.conf"], chroot)
+
+    # Same file on the FAT boot partition, so the network can be changed later
+    # from any computer that can read an SD card
+    pmb.chroot.root(
+        [
+            "install",
+            "-Dm600",
+            "/etc/wpa_supplicant/wpa_supplicant.conf",
+            "/boot/wpa_supplicant.conf",
+        ],
+        chroot,
+    )
+
+
 def configure_apk(install_local_pkgs: bool) -> None:
     """
     Copy over all official keys, and the keys used to compile local packages
@@ -186,14 +442,22 @@ def configure_apk(install_local_pkgs: bool) -> None:
     if install_local_pkgs:
         keys_dir = get_context().config.work / "config_apk_keys"
 
-    # Copy over keys
+    alpine_only = pmb.parse.deviceinfo().alpine_only
+
+    # Copy over keys. For alpine_only devices, deliberately leave out
+    # build.postmarketos.org.rsa.pub: the rootfs must not trust (and cannot
+    # reach) the postmarketOS binary repository.
     rootfs = Chroot.native() / "mnt/install"
-    for key in keys_dir.glob("*.pub"):
+    for key in keys_dir.glob("alpine-devel@*.rsa.pub" if alpine_only else "*.pub"):
         pmb.helpers.run.root(["cp", key, rootfs / "etc/apk/keys/"])
+    if alpine_only and install_local_pkgs:
+        # ...but the locally built device package still needs its key
+        for key in (get_context().config.work / "config_abuild").glob("*.pub"):
+            pmb.helpers.run.root(["cp", key, rootfs / "etc/apk/keys/"])
 
     # Copy over the corresponding APKINDEX files from cache
     index_files = pmb.helpers.repo.apkindex_files(
-        arch=pmb.parse.deviceinfo().arch, user_repository=False
+        arch=pmb.parse.deviceinfo().arch, user_repository=False, alpine_only=alpine_only
     )
     for f in index_files:
         pmb.helpers.run.root(["cp", f, rootfs / "var/cache/apk/"])
@@ -202,6 +466,18 @@ def configure_apk(install_local_pkgs: bool) -> None:
     pmb.chroot.root(
         ["sed", "-i", r"/\/mnt\/pmbootstrap\/packages/d", "/mnt/install/etc/apk/repositories"]
     )
+
+    # The chroot got a copy of the build host's /etc/resolv.conf so apk could
+    # resolve the mirrors (see pmb.chroot.init.copy_resolv_conf). Shipping it
+    # is both a leak of the builder's internal addressing and a real fault on
+    # the target: musl has no fallback resolver and waits ~5s per query, so
+    # until dhcpcd installs a lease - and permanently on any network that
+    # hands out no DNS - chronyd and "apk update" stall against a nameserver
+    # that does not exist there. Devices with NetworkManager overwrite this
+    # file on the first connection; an alpine_only device has dhcpcd, which
+    # only rewrites it once it has a lease.
+    if alpine_only:
+        pmb.chroot.root(["sh", "-c", ": > /mnt/install/etc/resolv.conf"])
 
 
 def set_user(config: Config) -> None:
@@ -514,6 +790,17 @@ def disable_service(config: Config, chroot: Chroot, service_name: str) -> None:
 
 
 def print_firewall_info(disabled: bool) -> None:
+    if pmb.parse.deviceinfo().alpine_only:
+        # The firewall comes from postmarketos-base-nftables, which is not
+        # installed on a device that only uses Alpine's packages
+        logging.info("")
+        logging.info("*** FIREWALL INFORMATION ***")
+        logging.info(
+            "No firewall is installed (deviceinfo_alpine_only). Install and configure"
+            " Alpine's nftables package if you want one."
+        )
+        return
+
     pmaports_cfg = pmb.config.pmaports.read_config()
     pmaports_ok = pmaports_cfg.get("supported_firewall", None) == "nftables"
 
@@ -826,7 +1113,7 @@ def create_fstab(
     else:
         fstab = f"""
 # <file system> <mount point> <type> <options> <dump> <pass>
-{root_mount_point} / {root_filesystem} defaults 0 0
+{root_mount_point} / {root_filesystem} defaults 0 1
 """.lstrip()
 
     if boot_dev:
@@ -839,7 +1126,7 @@ def create_fstab(
         if boot_filesystem in ("fat16", "fat32"):
             boot_filesystem = "vfat"
             boot_options += ",umask=0077,nosymfollow,codepage=437,iocharset=ascii"
-        fstab += f"{boot_mount_point} /boot {boot_filesystem} {boot_options} 0 0\n"
+        fstab += f"{boot_mount_point} /boot {boot_filesystem} {boot_options} 0 2\n"
 
     with (chroot / "tmp/fstab").open("w") as f:
         f.write(fstab)
@@ -933,8 +1220,13 @@ def install_system_image(
         create_crypttab(layout, chroot)
 
     # Run mkinitfs to pass UUIDs to cmdline
-    logging.info(f"({chroot}) mkinitfs")
-    pmb.chroot.root(["mkinitfs"], chroot)
+    pmb.chroot.initfs.run_mkinitfs(chroot)
+
+    # boot-deploy is a postmarketOS package, so on alpine_only devices nothing
+    # would write /boot/cmdline.txt and the firmware would boot the kernel
+    # without a root= argument.
+    if pmb.parse.deviceinfo().alpine_only and pmb.parse.deviceinfo().generate_cmdline_txt:
+        write_cmdline_txt(layout, chroot, filesystem, full_disk_encryption)
 
     # Clean up after running mkinitfs in chroot
     pmb.helpers.mount.umount_all(chroot.path)
@@ -1259,6 +1551,9 @@ def create_device_rootfs(
     full_disk_encryption: bool,
     no_sshd: bool,
     no_firewall: bool,
+    wifi_ssid: str | None = None,
+    wifi_psk: str | None = None,
+    wifi_country: str | None = None,
 ) -> None:
     # list all packages to be installed (including the ones specified by --add)
     # and upgrade the installed packages/apkindexes
@@ -1273,46 +1568,82 @@ def create_device_rootfs(
     # pmaports can figure out the username (legacy reasons: pmaports#820)
     set_user(context.config)
 
+    alpine_only = pmb.parse.deviceinfo().alpine_only
+
     # Fill install_packages
-    install_packages = [*pmb.config.install_device_packages, "device-" + device]
-    if not install_base:
-        install_packages = [p for p in install_packages if p != "postmarketos-base"]
-    ui_package_name = f"postmarketos-ui-{config.ui}"
-    if config.ui.lower() != "none":
-        install_packages += [ui_package_name]
+    if alpine_only:
+        # Everything postmarketOS-specific is skipped here on purpose: the base
+        # and UI meta packages, their providers and _pmb_recommends, the kernel
+        # and firmware subpackages of the device package (alpine_only devices
+        # depend on an Alpine kernel directly) and postmarketos-base-nofde /
+        # postmarketos-base-systemd. What is left is Alpine's base system plus
+        # the device package.
+        install_packages = [*pmb.config.install_device_packages_alpine_only, "device-" + device]
 
-    # Add additional providers of base/device/UI package
-    install_packages += get_selected_providers(install_packages)
+        # The postmarketos-ui-* meta packages are postmarketOS packages, so the
+        # selected UI is used as a plain Alpine package name instead: ui=sway
+        # installs Alpine's sway, ui=weston installs Alpine's weston. tinydm is
+        # Alpine's tiny display manager, which starts the session on boot (it is
+        # what the postmarketos-ui-* packages use too).
+        if config.ui.lower() != "none":
+            install_packages += [config.ui, "tinydm", "tinydm-openrc"]
 
-    install_packages += get_kernel_package(config)
-    install_packages += get_nonfree_packages(device)
-    if context.config.ui.lower() != "none":
-        ui_package = pmb.helpers.pmaports.get(ui_package_name, subpackages=False, must_exist=False)
-        if ui_package and context.config.ui_extras:
-            extra = f"postmarketos-ui-{config.ui}-extras"
-            extra_package = ui_package["subpackages"].get(extra)
-            if extra_package:
-                install_packages += [extra]
+            # Equivalent of _pmb_recommends in a postmarketos-ui-* APKBUILD:
+            # the terminal, launcher, audio stack, portals and so on that turn
+            # a bare compositor into a usable session.
+            if install_recommends:
+                install_packages += pmb.helpers.ui.alpine_ui_recommends(
+                    config.ui, pmb.parse.deviceinfo().arch
+                )
 
-    if context.config.extra_packages.lower() != "none":
-        install_packages += context.config.extra_packages.split(",")
-    if add:
-        install_packages += add.split(",")
+        if context.config.extra_packages.lower() != "none":
+            install_packages += context.config.extra_packages.split(",")
+        if add:
+            install_packages += add.split(",")
 
-    # postmarketos-base supports a dummy package for blocking unl0kr install
-    # when not required
-    if not full_disk_encryption:
-        install_packages += ["postmarketos-base-nofde"]
+        pmb.helpers.repo.update(pmb.parse.deviceinfo().arch, alpine_only=True)
+    else:
+        install_packages = [*pmb.config.install_device_packages, "device-" + device]
+        if not install_base:
+            install_packages = [p for p in install_packages if p != "postmarketos-base"]
+        ui_package_name = f"postmarketos-ui-{config.ui}"
+        if config.ui.lower() != "none":
+            install_packages += [ui_package_name]
 
-    pmb.helpers.repo.update(pmb.parse.deviceinfo().arch)
+        # Add additional providers of base/device/UI package
+        install_packages += get_selected_providers(install_packages)
 
-    # Install uninstallable "dependencies" by default
-    install_packages += get_recommends(install_packages, install_recommends)
+        install_packages += get_kernel_package(config)
+        install_packages += get_nonfree_packages(device)
+        if context.config.ui.lower() != "none":
+            ui_package = pmb.helpers.pmaports.get(
+                ui_package_name, subpackages=False, must_exist=False
+            )
+            if ui_package and context.config.ui_extras:
+                extra = f"postmarketos-ui-{config.ui}-extras"
+                extra_package = ui_package["subpackages"].get(extra)
+                if extra_package:
+                    install_packages += [extra]
 
-    # Install the base-systemd package first to make sure presets are available
-    # when services are installed later
-    if pmb.config.other.is_systemd_selected(context.config):
-        pmb.chroot.apk.install(["postmarketos-base-systemd"], chroot)
+        if context.config.extra_packages.lower() != "none":
+            install_packages += context.config.extra_packages.split(",")
+        if add:
+            install_packages += add.split(",")
+
+        # postmarketos-base supports a dummy package for blocking unl0kr install
+        # when not required
+        if not full_disk_encryption:
+            install_packages += ["postmarketos-base-nofde"]
+
+        pmb.helpers.repo.update(pmb.parse.deviceinfo().arch)
+
+        # Install uninstallable "dependencies" by default
+        install_packages += get_recommends(install_packages, install_recommends)
+
+        # Install the base-systemd package first to make sure presets are
+        # available when services are installed later
+        if pmb.config.other.is_systemd_selected(context.config):
+            pmb.chroot.apk.install(["postmarketos-base-systemd"], chroot)
 
     # Install all packages to device rootfs chroot (and rebuild the initramfs,
     # because that doesn't always happen automatically yet, e.g. when the user
@@ -1337,6 +1668,12 @@ def create_device_rootfs(
     setup_hostname(device, config.hostname)
 
     setup_appstream(context.offline, chroot)
+
+    if wifi_ssid:
+        setup_wifi(chroot, wifi_ssid, wifi_psk, wifi_country)
+
+    if alpine_only and config.ui.lower() != "none":
+        setup_tinydm(chroot, config.ui, config.user)
 
     if no_sshd:
         disable_service(config, chroot, "sshd")
@@ -1373,6 +1710,9 @@ def install(
     verbose: bool,
     zap: bool,
     is_split: bool,
+    wifi_ssid: str | None = None,
+    wifi_psk: str | None = None,
+    wifi_country: str | None = None,
 ) -> None:
     device = get_context().config.device
     chroot = Chroot(ChrootType.ROOTFS, device)
@@ -1420,6 +1760,9 @@ def install(
         full_disk_encryption,
         no_sshd,
         no_firewall,
+        wifi_ssid=wifi_ssid,
+        wifi_psk=wifi_psk,
+        wifi_country=wifi_country,
     )
     step += 1
 
