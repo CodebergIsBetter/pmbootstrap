@@ -56,6 +56,7 @@ class Config:
     device: str = "qemu-amd64"
     extra_packages: str = "none"
     extra_space: int = 0
+    headless: bool = False
     hostname: str = ""
     is_default_channel: bool = True
     jobs: int = multiprocessing.cpu_count()
