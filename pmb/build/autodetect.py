@@ -1,10 +1,11 @@
 # Copyright 2023 Oliver Smith
 # SPDX-License-Identifier: GPL-3.0-or-later
-import pmb.config
 import pmb.helpers.pmaports
+import pmb.parse.apkindex
 from pmb.core.apk_package import Apkbuild
 from pmb.core.arch import Arch
 from pmb.core.context import get_context
+from pmb.helpers import logging
 from pmb.meta import Cache
 from pmb.types import CrossCompile
 
@@ -50,8 +51,39 @@ def arch(package: str | Apkbuild) -> Arch:
         return Arch.native()
 
 
+@Cache("arch")
+def cross_compiler_exists(arch: Arch) -> bool:
+    """Check whether a gcc-$arch cross compiler can be installed at all.
+
+    pmaports generates these with 'pmbootstrap aportgen gcc-$arch'. The armhf
+    ones were dropped when postmarketOS deprecated that architecture, so for
+    armhf this returns False and we fall back to building inside a foreign
+    chroot with QEMU.
+    """
+    if pmb.helpers.pmaports.find(f"gcc-{arch}", False, subpackages=False):
+        return True
+    return bool(pmb.parse.apkindex.providers(f"gcc-{arch}", Arch.native(), False))
+
+
 def crosscompile(apkbuild: Apkbuild, arch: Arch) -> CrossCompile:
     """Decide the type of compilation necessary to build a given APKBUILD."""
+    ret = _crosscompile(apkbuild, arch)
+
+    # Every mode but QEMU_ONLY/UNNECESSARY needs a cross compiler in the native
+    # chroot (see pmb.build.init_compiler). Without one, building inside a
+    # foreign chroot under QEMU is slow but correct, which beats failing with
+    # "gcc-armhf: Could not find it in pmaports or any APKINDEX!".
+    if ret.enabled() and not cross_compiler_exists(arch):
+        logging.warn_once(
+            f"NOTE: there is no gcc-{arch} cross compiler, building with QEMU instead"
+            " (this is slower)"
+        )
+        return CrossCompile.QEMU_ONLY
+
+    return ret
+
+
+def _crosscompile(apkbuild: Apkbuild, arch: Arch) -> CrossCompile:
     if not get_context().cross:
         return CrossCompile.QEMU_ONLY
     if not arch.cpu_emulation_required():
