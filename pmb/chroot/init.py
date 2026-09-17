@@ -14,6 +14,7 @@ from pmb.core import Chroot, ChrootType
 from pmb.core.context import get_context
 from pmb.helpers import logging
 from pmb.meta import Cache
+from pmb.parse.deviceinfo import device_is_alpine_only
 from pmb.types import PathString
 
 
@@ -99,10 +100,21 @@ def init(chroot: Chroot) -> None:
 
     pmb.chroot.mount(chroot)
     mark_in_chroot(chroot)
+
+    # Chroots that end up on the device must not see postmarketOS' binary
+    # repository when the device is installed from Alpine only. Buildroots and
+    # the native chroot are deliberately excluded: nothing from them is copied
+    # into the image, and they still need pmaports to build the device package.
+    alpine_only = chroot.type in [
+        ChrootType.ROOTFS,
+        ChrootType.INSTALLER,
+        ChrootType.IMAGE,
+    ] and device_is_alpine_only(chroot.name)
+
     # When already initialized: just prepare the chroot
     if chroot.exists():
         copy_resolv_conf(chroot)
-        pmb.helpers.apk.update_repository_list(chroot.path)
+        pmb.helpers.apk.update_repository_list(chroot.path, alpine_only=alpine_only)
         warn_if_chroots_outdated()
         return
 
@@ -114,11 +126,11 @@ def init(chroot: Chroot) -> None:
     # Initialize /etc/apk/keys/, resolv.conf, repositories
     init_keys()
     copy_resolv_conf(chroot)
-    pmb.helpers.apk.update_repository_list(chroot.path)
+    pmb.helpers.apk.update_repository_list(chroot.path, alpine_only=alpine_only)
 
     pmb.config.workdir.chroot_save_init(chroot)
 
-    pmb.helpers.repo.update(chroot.arch)
+    pmb.helpers.repo.update(chroot.arch, alpine_only=alpine_only)
     # Create the /usr-merge-related symlinks, which needs to be done manually
     pmb.helpers.run.root(
         [
@@ -131,8 +143,19 @@ def init(chroot: Chroot) -> None:
     )
     pmb.helpers.run.root(["ln", "-s", "usr/bin", "usr/sbin", "usr/lib", f"{chroot.path}/"])
     # Create the bin-merge-related symlinks, which are done manually to be
-    # consistent with the /usr-merge
-    if pmb.config.pmaports.read_config().get("supported_bin_merge", False):
+    # consistent with the /usr-merge.
+    #
+    # Not for alpine_only devices: alpine-baselayout ships /bin, /sbin,
+    # /usr/bin and /usr/sbin as four distinct real directories, and Alpine's
+    # packages are built for that. Collapsing sbin into bin makes any package
+    # that ships both bin/X and sbin/X destroy itself, because the two paths
+    # become one and apk extracts the compat symlink over the real binary.
+    # eudev is one such package: it ships bin/udevadm plus a compat
+    # sbin/udevadm -> ../bin/udevadm, which under the bin-merge becomes a
+    # symlink to itself, so udevadm fails with ELOOP and udev-trigger dies.
+    # (This is why pmaports carries temp/eudev, "Forked from Alpine to remove
+    # symlink in /sbin/udevadm".)
+    if not alpine_only and pmb.config.pmaports.read_config().get("supported_bin_merge", False):
         pmb.helpers.run.root(
             [
                 "rm",
