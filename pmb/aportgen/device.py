@@ -15,18 +15,24 @@ from pmb.types import Bootimg
 
 def ask_for_architecture() -> Arch:
     architectures = [str(a) for a in Arch.supported()]
-    # Don't show armhf, new ports shouldn't use this architecture
-    if "armhf" in architectures:
-        architectures.remove("armhf")
     while True:
         ret = pmb.helpers.cli.ask(
             "Device architecture", architectures, "aarch64", complete=architectures
         )
         if ret in architectures:
+            if ret == "armhf":
+                # ARMv6. postmarketOS does not build armhf packages anymore, so
+                # such a port needs deviceinfo_alpine_only="true" and must get
+                # everything from Alpine's repositories.
+                logging.info(
+                    "NOTE: postmarketOS does not build armhf packages. This port will be"
+                    ' generated with deviceinfo_alpine_only="true", which installs Alpine'
+                    " Linux only. See <https://postmarketos.org/deviceinfo>."
+                )
             return Arch.from_str(ret)
         logging.fatal(
             "ERROR: Invalid architecture specified. If you want to add a new architecture, edit "
-            "build_device_architectures in pmb/config/__init__.py."
+            "Arch in pmb/core/arch.py."
         )
 
 
@@ -198,6 +204,11 @@ def generate_deviceinfo(
         # Device related
         """
 
+    if arch == Arch.armhf:
+        # postmarketOS does not build armhf packages, so such a device can only
+        # be installed from Alpine's repositories
+        content += 'deviceinfo_alpine_only="true"\n'
+
     content += f'deviceinfo_chassis="{chassis}"\n' if chassis != "None" else ""
 
     if device_category == pmb.helpers.devices.DeviceCategory.DOWNSTREAM:
@@ -281,11 +292,18 @@ def generate_apkbuild(
     device_category: pmb.helpers.devices.DeviceCategory,
 ) -> None:
     # Dependencies
-    depends = ["postmarketos-base"]
-    if device_category == pmb.helpers.devices.DeviceCategory.DOWNSTREAM:
-        depends += ["linux-" + "-".join(pkgname.split("-")[1:]), "postmarketos-base-downstream"]
+    if arch == Arch.armhf:
+        # deviceinfo_alpine_only: no postmarketOS packages may be depended on
+        depends = ["alpine-base", "mkinitfs", "linux-CHANGEME"]
     else:
-        depends += ["linux-CHANGEME"]
+        depends = ["postmarketos-base"]
+        if device_category == pmb.helpers.devices.DeviceCategory.DOWNSTREAM:
+            depends += [
+                "linux-" + "-".join(pkgname.split("-")[1:]),
+                "postmarketos-base-downstream",
+            ]
+        else:
+            depends += ["linux-CHANGEME"]
 
     if flash_method in ["fastboot", "heimdall-bootimg"]:
         depends.append("android-tools-mkbootimg")
