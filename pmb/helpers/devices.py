@@ -33,6 +33,7 @@ class DeviceCategory(Enum):
     """Enum for representing a specific device category."""
 
     ARCHIVED = "archived"
+    ALPINE = "alpine"
     DOWNSTREAM = "downstream"
     TESTING = "testing"
     COMMUNITY = "community"
@@ -51,6 +52,7 @@ class DeviceCategory(Enum):
             DeviceCategory.COMMUNITY,
             DeviceCategory.TESTING,
             DeviceCategory.DOWNSTREAM,
+            DeviceCategory.ALPINE,
         ]
 
     def allows_downstream_ports(self) -> bool:
@@ -61,7 +63,7 @@ class DeviceCategory(Enum):
         :returns: True, if the category allows downstream ports, False if only allows mainline ports.
         """
         match self:
-            case DeviceCategory.ARCHIVED | DeviceCategory.DOWNSTREAM:
+            case DeviceCategory.ARCHIVED | DeviceCategory.DOWNSTREAM | DeviceCategory.ALPINE:
                 return True
             case DeviceCategory.TESTING | DeviceCategory.COMMUNITY | DeviceCategory.MAIN:
                 return False
@@ -75,6 +77,11 @@ class DeviceCategory(Enum):
         match self:
             case DeviceCategory.ARCHIVED:
                 return "ports that have a better alternative available"
+            case DeviceCategory.ALPINE:
+                return (
+                    "ports that install Alpine Linux only, because postmarketOS does not build"
+                    " packages for their architecture (deviceinfo_alpine_only)"
+                )
             case DeviceCategory.DOWNSTREAM:
                 return "ports that use a downstream kernel — very limited functionality. Not recommended"
             case DeviceCategory.TESTING:
@@ -96,6 +103,8 @@ class DeviceCategory(Enum):
         match self:
             case DeviceCategory.ARCHIVED:
                 return styles["RED"]
+            case DeviceCategory.ALPINE:
+                return styles["CYAN"]
             case DeviceCategory.DOWNSTREAM:
                 return styles["YELLOW"]
             case DeviceCategory.TESTING:

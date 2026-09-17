@@ -107,6 +107,7 @@ is_interactive = sys.stdout.isatty() and sys.stderr.isatty() and sys.stdin.isatt
 styles = {
     "BLUE": "\033[94m",
     "BOLD": "\033[1m",
+    "CYAN": "\033[96m",
     "GREEN": "\033[92m",
     "MAGENTA": "\033[95m",
     "RED": "\033[91m",
