@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import glob
 import inspect
 import os
 from dataclasses import dataclass
@@ -97,7 +98,7 @@ def _parse_kernel_suffix(info: dict[str, str], device: str, kernel: str | None) 
     # FIXME: We shouldn't have test-specific code in regular implementations like this.
     # We don't support parsing the kernel variants in tests yet, since this code
     # depends on pmaports being available and calls into a whole lot of other code.
-    if os.environ.get("PYTEST_CURRENT_TEST", "").startswith("pmb/parse/test_deviceinfo.py"):
+    if os.environ.get("PYTEST_CURRENT_TEST", "").startswith("test/parse/test_deviceinfo.py"):
         # If you hit this, you're probably trying to add a test for kernel variants.
         # You'll need to figure out how to mock the APKBUILD parsing below.
         if kernel is not None:
@@ -165,7 +166,8 @@ class Deviceinfo:
     # device
     chassis: str | None
     keyboard: str | None = ""  # deprecated
-    drm: bool | None = False
+    drm: bool = False
+    alpine_only: bool = False
     dev_touchscreen: str | None = ""
     dev_touchscreen_calibration: str | None = ""
     append_dtb: str | None = ""
@@ -173,6 +175,7 @@ class Deviceinfo:
     # bootloader
     flash_method: str = ""
     boot_filesystem: str | None = ""
+    generate_cmdline_txt: bool = False
     create_initfs_extra: bool | None = False
     create_prep_boot: bool | None = False
     initfs_compression: InitfsCompression = InitfsCompression(InitfsCompressionFormat.GZIP, None)
@@ -265,6 +268,12 @@ class Deviceinfo:
                     self.arch = Arch.from_str(value)
                 case "gpu_accelerated":  # deprecated
                     self.drm = value == "true"
+                case "drm":
+                    self.drm = value == "true"
+                case "alpine_only":
+                    self.alpine_only = value == "true"
+                case "generate_cmdline_txt":
+                    self.generate_cmdline_txt = value == "true"
                 case "header_version":
                     self.header_version = int(value)
                 case "initfs_compression":
@@ -274,6 +283,49 @@ class Deviceinfo:
 
         if not self.flash_method:
             self.flash_method = "none"
+
+
+@Cache("device")
+def device_is_alpine_only(device: str | None = None) -> bool:
+    """Check whether a device is installed from Alpine's repositories only.
+
+    This deliberately does not go through :func:`deviceinfo` or
+    :func:`pmb.helpers.devices.find_path`. Both of them end up in
+    ``pkgrepo_paths()``, which needs to know whether the systemd extra-repo is
+    enabled, which asks for the service manager, which asks this function: an
+    infinite recursion. So look the single variable up by hand instead, in
+    pmaports only (device packages never live in an extra-repo).
+
+    It also never raises: it is called from code paths that run without a
+    device being configured (e.g. ``pmbootstrap chroot`` on the native chroot),
+    and the answer for those is "no".
+
+    :param device: defaults to the configured device
+    """
+    if not device:
+        try:
+            device = get_context().config.device
+        except RuntimeError:  # no context set up (yet)
+            return False
+    if not device:
+        return False
+
+    try:
+        matches = glob.glob(
+            os.path.join(pkgrepo_default_path(), f"device/*/device-{device}/deviceinfo")
+        )
+    except RuntimeError:  # no package repositories configured
+        return False
+    if len(matches) != 1:
+        return False
+
+    # deviceinfo_alpine_only is device wide, it has no kernel variants, so
+    # there is no need to run the kernel suffix parsing here.
+    with open(matches[0]) as handle:
+        for line in handle:
+            if line.startswith("deviceinfo_alpine_only="):
+                return line.split("=", 1)[1].strip().strip('"') == "true"
+    return False
 
 
 class DeviceinfoSchemaDatatype(Enum):

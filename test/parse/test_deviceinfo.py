@@ -208,3 +208,44 @@ def test_syntax_error(tmp_file: Path) -> None:
 
     with pytest.raises(SyntaxError):
         Deviceinfo(tmp_file)
+
+
+# deviceinfo is a shell file, so every value is a string. Variables that are
+# documented as booleans in pmaports' deviceinfo_schema.toml must not end up as
+# the truthy string "false" on the Deviceinfo object.
+@pytest.mark.parametrize("key", ["drm", "alpine_only", "generate_cmdline_txt"])
+def test_boolean_deviceinfo_keys(tmp_path: Path, key: str) -> None:
+    def parse(value: str) -> Deviceinfo:
+        path = Path(tempfile.mkstemp(dir=tmp_path)[1])
+        with open(path, "w") as f:
+            f.write('deviceinfo_codename="test"\n')
+            f.write('deviceinfo_chassis="handset"\n')
+            f.write('deviceinfo_arch="armhf"\n')
+            f.write(f'deviceinfo_{key}="{value}"\n')
+        return Deviceinfo(path)
+
+    assert getattr(parse("true"), key) is True
+    assert getattr(parse("false"), key) is False
+
+
+def test_alpine_only_defaults_to_false(tmp_file: Path) -> None:
+    with open(tmp_file, "w") as f:
+        f.write('deviceinfo_codename="test"\n')
+        f.write('deviceinfo_chassis="handset"\n')
+        f.write('deviceinfo_arch="aarch64"\n')
+
+    info = Deviceinfo(tmp_file)
+    assert info.alpine_only is False
+    assert info.drm is False
+    assert info.generate_cmdline_txt is False
+
+
+# deviceinfo_gpu_accelerated is the deprecated spelling of deviceinfo_drm
+def test_gpu_accelerated_maps_to_drm(tmp_file: Path) -> None:
+    with open(tmp_file, "w") as f:
+        f.write('deviceinfo_codename="test"\n')
+        f.write('deviceinfo_chassis="handset"\n')
+        f.write('deviceinfo_arch="armhf"\n')
+        f.write('deviceinfo_gpu_accelerated="true"\n')
+
+    assert Deviceinfo(tmp_file).drm is True
