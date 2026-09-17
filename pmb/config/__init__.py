@@ -333,6 +333,10 @@ default_ip = "172.16.42.1"
 install_native_packages = ["cryptsetup", "util-linux", "parted"]
 install_device_packages = ["postmarketos-base"]
 
+# Same, for devices that set deviceinfo_alpine_only: no postmarketOS packages,
+# just Alpine's base system. The device package pulls in everything else.
+install_device_packages_alpine_only = ["alpine-base"]
+
 #
 # FLASH
 #
