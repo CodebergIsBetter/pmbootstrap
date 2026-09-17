@@ -288,6 +288,32 @@ def ask_for_ui_extras(config: Config, ui: str) -> bool:
     return pmb.helpers.cli.confirm("Enable this package?", default=config.ui_extras)
 
 
+def ask_for_headless(config: Config, deviceinfo: Deviceinfo) -> bool:
+    """
+    Ask whether the device will be set up without a screen attached.
+
+    Only asked for devices that set deviceinfo_alpine_only, because that is
+    where pmbootstrap can configure Wi-Fi at install time. Everything else
+    configures the network with NetworkManager after the first boot.
+    """
+    if not deviceinfo.alpine_only:
+        return False
+
+    logging.info(
+        "A headless setup has no screen or keyboard attached: the device joins a Wi-Fi network"
+        " on the first boot and is administered over SSH."
+    )
+    headless = pmb.helpers.cli.confirm("Set this device up headless?", default=config.headless)
+
+    if headless:
+        logging.info(
+            "OK. 'pmbootstrap install' will ask for the user password and for the Wi-Fi network"
+            " name and passphrase, and write them into the image."
+        )
+
+    return headless
+
+
 def ask_for_service_manager(config: Config, ui: str) -> ServiceManagerConfig:
     default, available, reason = pmb.config.other.service_managers_from_packaging(ui)
 
@@ -986,6 +1012,8 @@ def frontend(args: PmbArgs) -> None:
     ui = ask_for_ui(deviceinfo)
     config.ui = ui
     config.ui_extras = ask_for_ui_extras(config, ui)
+
+    config.headless = ask_for_headless(config, deviceinfo)
 
     # service manager
     print_systemd_warning(device_is_new, apkbuild, config.kernel)
