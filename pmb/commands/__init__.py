@@ -166,6 +166,9 @@ def run_command(args: PmbArgs) -> None:
                 args.split,
                 args.verbose,
                 args.zap,
+                wifi_ssid=args.wifi_ssid,
+                wifi_psk=args.wifi_psk,
+                wifi_country=args.wifi_country,
             )
         case "shutdown":
             shutdown()
