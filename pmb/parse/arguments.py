@@ -77,6 +77,21 @@ def arguments_install(subparser: argparse._SubParsersAction[argparse.ArgumentPar
         "--no-firewall", action="store_true", help="do not enable the firewall by default"
     )
     ret.add_argument(
+        "--wifi-ssid",
+        help="connect to this Wi-Fi network on first boot, for headless setups."
+        " Only for devices with deviceinfo_alpine_only",
+    )
+    ret.add_argument(
+        "--wifi-country",
+        default="US",
+        help="ISO 3166-1 alpha-2 country code for the Wi-Fi regulatory domain (default: US)",
+    )
+    ret.add_argument(
+        "--wifi-psk",
+        help="passphrase (8-63 characters) or 64 character hex PSK for --wifi-ssid."
+        " Leave out for an open network",
+    )
+    ret.add_argument(
         "--password",
         help="dummy password for automating the"
         " installation - will be handled in PLAIN TEXT during"
