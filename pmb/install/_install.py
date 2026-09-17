@@ -1166,6 +1166,19 @@ def install_system_image(
     """
     config = get_context().config
     device = chroot.name
+
+    # An alpine_only device installs no postmarketOS package, so labelling its
+    # filesystems pmOS_* is simply wrong - and these are the labels a user
+    # sees when they put the card in another computer to edit
+    # wpa_supplicant.conf, which is the documented recovery path. The boot
+    # chain refers to both partitions by UUID (cmdline.txt root=UUID=... and
+    # fstab), never by label, so renaming them is safe.
+    if pmb.parse.deviceinfo().alpine_only:
+        if boot_label == "pmOS_boot":
+            boot_label = "alpine_boot"
+        if root_label == "pmOS_root":
+            root_label = "alpine_root"
+
     # Partition and fill image file/disk block device
     logging.info(f"*** ({step}/{steps}) PREPARE INSTALL BLOCKDEVICE ***")
     pmb.helpers.mount.umount_all(chroot.path)
