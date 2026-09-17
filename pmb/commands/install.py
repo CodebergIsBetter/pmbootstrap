@@ -4,6 +4,7 @@ from getpass import getpass
 from pathlib import Path
 
 import pmb.config
+import pmb.helpers.cli
 import pmb.install
 import pmb.parse
 from pmb.core.context import get_context
@@ -41,6 +42,9 @@ def install(
     split: bool | None,
     verbose: bool,
     zap: bool,
+    wifi_ssid: str | None = None,
+    wifi_psk: str | None = None,
+    wifi_country: str | None = None,
 ) -> None:
     config = get_context().config
     device = config.device
@@ -110,6 +114,30 @@ def install(
     # Verify that the root filesystem is supported by current pmaports branch
     pmb.install.get_root_filesystem(filesystem)
 
+    # Ask for the wifi credentials, like we ask for the password above. Only
+    # alpine_only devices, everything else configures wifi through
+    # NetworkManager after the first boot.
+    if (
+        not wifi_ssid
+        and config.headless
+        and not get_context().assume_yes
+        and pmb.parse.device_is_alpine_only(config.device)
+    ):
+        logging.info(
+            "This device is configured for a headless setup, so it needs Wi-Fi credentials to"
+            " be reachable over SSH after the first boot. Leave empty to skip."
+        )
+        wifi_ssid = pmb.helpers.cli.ask("Wi-Fi network name (SSID)", None, "", False)
+        if wifi_ssid:
+            while True:
+                wifi_psk = getpass(f"Passphrase for '{wifi_ssid}' (empty for an open network): ")
+                if not wifi_psk or 8 <= len(wifi_psk) <= 63 or len(wifi_psk) == 64:
+                    break
+                logging.error("ERROR: Must be 8 to 63 characters, or a 64 character hex PSK!")
+            wifi_country = pmb.helpers.cli.ask(
+                "Wi-Fi country code", None, wifi_country or "US", False
+            )
+
     pmb.install.install(
         add,
         android_recovery_zip,
@@ -139,4 +167,7 @@ def install(
         verbose,
         zap,
         is_split,
+        wifi_ssid=wifi_ssid,
+        wifi_psk=wifi_psk,
+        wifi_country=wifi_country,
     )
