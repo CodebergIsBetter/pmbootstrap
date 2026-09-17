@@ -5,22 +5,100 @@ from pathlib import Path
 import pmb.chroot.apk
 import pmb.chroot.initfs_hooks
 import pmb.helpers.cli
+import pmb.helpers.run
 from pmb.core import Chroot
 from pmb.core.context import get_context
 from pmb.helpers import logging
 from pmb.helpers.exceptions import CommandFailedError, NonBugError, PackagingError
-from pmb.parse.deviceinfo import Deviceinfo, InitfsCompressionFormat
+from pmb.parse.deviceinfo import Deviceinfo, InitfsCompressionFormat, device_is_alpine_only
 from pmb.types import PathString, RunOutputTypeDefault
+
+# Mirrors the apk trigger that Alpine's mkinitfs registers on
+# /lib/modules/* and /usr/lib/modules/*. Running mkinitfs without arguments is
+# not an option here: it would default to $(uname -r), which is the host's
+# kernel and not the one we just installed into the chroot.
+_ALPINE_MKINITFS_SH = """
+set -e
+found=
+for moddir in /lib/modules/*/; do
+	[ -d "$moddir" ] || continue
+	abi_release=$(basename "$moddir")
+	if [ -e "$moddir/kernel-suffix" ]; then
+		suffix=$(cat "$moddir/kernel-suffix")
+	else
+		flavor=${abi_release##*[0-9]-}
+		if [ "$flavor" != "$abi_release" ]; then
+			suffix="-$flavor"
+		else
+			suffix=""
+		fi
+	fi
+	echo "mkinitfs -o /boot/initramfs$suffix $abi_release"
+	mkinitfs -o "/boot/initramfs$suffix" "$abi_release"
+	found=1
+done
+if [ -z "$found" ]; then
+	echo "ERROR: no kernel found in /lib/modules, cannot build an initramfs" >&2
+	exit 1
+fi
+
+# mkinitfs' apk trigger symlinks /boot/boot to "." so that extlinux can
+# resolve /boot/<kernel> when /boot is a separate partition. We don't use
+# extlinux, and the symlink cannot be copied onto a FAT boot partition
+# ("cp: can't create symlink ...: Operation not permitted").
+if [ -L /boot/boot ]; then
+	rm -f /boot/boot
+fi
+"""
+
+
+def run_mkinitfs(chroot: Chroot) -> None:
+    """Generate the initramfs inside the chroot."""
+    logging.info(f"({chroot}) mkinitfs")
+
+    if device_is_alpine_only(chroot.name):
+        # Alpine's mkinitfs copies /etc/apk/keys/* into the initramfs, and that
+        # directory is a bind mount of the keyring shared by every chroot, so
+        # the postmarketOS build key would end up inside the image even though
+        # configure_apk() keeps it out of the rootfs. Hide it for the duration.
+        # If we die in between, init_keys() copies it back on the next run.
+        # Move it out of the directory, not just rename it: mkinitfs globs
+        # /etc/apk/keys/*, so a renamed key is copied in all the same.
+        # pmos@local-*.rsa.pub goes too. It is pmbootstrap's own build key
+        # rather than anything postmarketOS issued, but nothing inside the
+        # initramfs verifies a package, so it is dead weight there - and it is
+        # what a purity grep for "pmos" trips over.
+        keydir = get_context().config.work / "config_apk_keys"
+        hiddendir = get_context().config.work / "config_apk_keys_hidden"
+        hide = [
+            *keydir.glob("build.postmarketos.org.rsa.pub"),
+            *keydir.glob("pmos@local-*.rsa.pub"),
+        ]
+        if hide:
+            pmb.helpers.run.root(["mkdir", "-p", hiddendir])
+        for key in hide:
+            pmb.helpers.run.root(["mv", key, hiddendir / key.name])
+        try:
+            pmb.chroot.root(["sh", "-e", "-c", _ALPINE_MKINITFS_SH], chroot)
+        finally:
+            for key in hide:
+                stashed = hiddendir / key.name
+                if stashed.exists():
+                    pmb.helpers.run.root(["mv", stashed, key])
+    else:
+        pmb.chroot.root(["mkinitfs"], chroot)
 
 
 def build(chroot: Chroot) -> None:
-    # Update mkinitfs and hooks
-    pmb.chroot.apk.install(["postmarketos-mkinitfs"], chroot)
-    pmb.chroot.initfs_hooks.update(chroot)
+    if device_is_alpine_only(chroot.name):
+        # Alpine's mkinitfs, and no postmarketos-mkinitfs-hook-* packages
+        pmb.chroot.apk.install(["mkinitfs"], chroot)
+    else:
+        # Update mkinitfs and hooks
+        pmb.chroot.apk.install(["postmarketos-mkinitfs"], chroot)
+        pmb.chroot.initfs_hooks.update(chroot)
 
-    # Call mkinitfs
-    logging.info(f"({chroot}) mkinitfs")
-    pmb.chroot.root(["mkinitfs"], chroot)
+    run_mkinitfs(chroot)
 
 
 def extract(chroot: Chroot, deviceinfo: Deviceinfo, extra: bool = False) -> Path:
