@@ -67,6 +67,15 @@ def service_managers_from_user_selection(config: Config) -> tuple[ServiceManager
     Get selected service manager and reasoning based on user selection in
     "pmbootstrap init".
     """
+    # Imported here to avoid a circular import at module load time
+    from pmb.parse.deviceinfo import device_is_alpine_only
+
+    # systemd is packaged in postmarketOS' extra-repo, so a device that is
+    # installed from Alpine only can only use OpenRC (which is what
+    # alpine-base depends on anyway).
+    if device_is_alpine_only(config.device):
+        return ServiceManagerConfig.OPENRC, "device sets deviceinfo_alpine_only"
+
     default, available, reason = service_managers_from_packaging(config.ui)
     selected = ServiceManagerConfig.SYSTEMD
 
