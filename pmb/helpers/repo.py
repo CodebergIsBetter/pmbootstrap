@@ -55,9 +55,11 @@ def apkindex_hash(url: str, length: int = 8) -> Path:
 
 # FIXME: make config.mirrors a normal dict
 # mypy: disable-error-code="literal-required"
-@Cache("user_repository", "mirrors_exclude")
+@Cache("user_repository", "mirrors_exclude", "alpine_only")
 def get_repos_from_config(
-    user_repository: Path | None = None, mirrors_exclude: list[str] | Literal[True] = []
+    user_repository: Path | None = None,
+    mirrors_exclude: list[str] | Literal[True] | None = None,
+    alpine_only: bool = False,
 ) -> list[str]:
     """
     Get a list of repository URLs, as they are in /etc/apk/repositories.
@@ -65,14 +67,28 @@ def get_repos_from_config(
     :param user_repository: add /mnt/pmbootstrap/packages
     :param mirrors_exclude: mirrors to exclude (see pmb.core.config.Mirrors) or true to exclude
                             all mirrors and only return the local repos
+    :param alpine_only: only return Alpine's mirrors, for devices that set
+                        deviceinfo_alpine_only (see pmb.parse.deviceinfo)
     :returns: list of mirror strings, like ["/mnt/pmbootstrap/packages",
                                             "http://...", ...]
     """
+    # Never mutate the caller's list below (see mirrors_exclude.append()); the
+    # @Cache key is built from the arguments before this function runs, so a
+    # mutated argument would also poison the cache.
+    if mirrors_exclude is None:
+        mirrors_exclude = []
+    elif mirrors_exclude is not True:
+        mirrors_exclude = list(mirrors_exclude)
+
     ret: list[str] = []
 
     # Local user repository (for packages compiled with pmbootstrap)
     if user_repository:
-        ret.extend(str(user_repository / channel) for channel in pmb.config.pmaports.all_channels())
+        channels = pmb.config.pmaports.all_channels()
+        if alpine_only:
+            # No systemd channel: alpine_only devices are always OpenRC
+            channels = [c for c in channels if not c.startswith("systemd-")]
+        ret.extend(str(user_repository / channel) for channel in channels)
 
     if mirrors_exclude is True:
         return ret
@@ -86,11 +102,15 @@ def get_repos_from_config(
     mirrordir_alpine = channel_cfg["mirrordir_alpine"]
 
     # Don't add the systemd mirror if systemd is disabled
-    if not pmb.config.is_systemd_selected(config):
+    if not alpine_only and not pmb.config.is_systemd_selected(config):
         mirrors_exclude.append("systemd")
 
-    # ["pmaports", "systemd", "alpine", "plasma-nightly"]
-    for repo in [*pkgrepo_names(), "alpine"]:
+    # ["pmaports", "systemd", "alpine", "plasma-nightly"], or just ["alpine"]
+    # for alpine_only devices. This is an allowlist on purpose: excluding the
+    # known postmarketOS repos by name would silently let a future extra-repo
+    # leak back into an "Alpine only" rootfs.
+    repos = ["alpine"] if alpine_only else [*pkgrepo_names(), "alpine"]
+    for repo in repos:
         if repo in mirrors_exclude:
             continue
 
@@ -127,7 +147,10 @@ def get_repos_from_config(
 
 
 def apkindex_files(
-    arch: Arch | None = None, user_repository: bool = True, exclude_mirrors: list[str] = []
+    arch: Arch | None = None,
+    user_repository: bool = True,
+    exclude_mirrors: list[str] | None = None,
+    alpine_only: bool = False,
 ) -> list[Apkindex]:
     """
     Get a list of outside paths to all resolved APKINDEX.tar.gz files for a specific arch.
@@ -135,6 +158,7 @@ def apkindex_files(
     :param arch: defaults to native
     :param user_repository: add path to index of locally built packages
     :param exclude_mirrors: list of mirrors to exclude (e.g. ["alpine", "pmaports"])
+    :param alpine_only: only consider Alpine's mirrors
     :returns: list of absolute APKINDEX.tar.gz file paths
     """
     if not arch:
@@ -143,23 +167,31 @@ def apkindex_files(
     ret: list[Apkindex] = []
     # Local user repository (for packages compiled with pmbootstrap)
     if user_repository:
+        channels = pmb.config.pmaports.all_channels()
+        if alpine_only:
+            channels = [c for c in channels if not c.startswith("systemd-")]
         ret.extend(
             Apkindex(get_context().config.work / "packages" / channel / arch / "APKINDEX.tar.gz")
-            for channel in pmb.config.pmaports.all_channels()
+            for channel in channels
         )
 
     # Resolve the APKINDEX.$HASH.tar.gz files
     ret.extend(
         Apkindex(file)
-        for url in get_repos_from_config(None, exclude_mirrors)
+        for url in get_repos_from_config(None, exclude_mirrors, alpine_only)
         if (file := get_context().config.work / f"cache_apk_{arch}" / apkindex_hash(url)).exists()
     )
 
     return ret
 
 
-@Cache("arch", force=False)
-def update(arch: Arch | None = None, force: bool = False, existing_only: bool = False) -> bool:
+@Cache("arch", "alpine_only", force=False)
+def update(
+    arch: Arch | None = None,
+    force: bool = False,
+    existing_only: bool = False,
+    alpine_only: bool = False,
+) -> bool:
     """
     Download the APKINDEX files for all URLs depending on the architectures.
 
@@ -168,6 +200,7 @@ def update(arch: Arch | None = None, force: bool = False, existing_only: bool = 
     :param force: even update when the APKINDEX file is fairly recent
     :param existing_only: only update the APKINDEX files that already exist,
                           this is used by "pmbootstrap update"
+    :param alpine_only: only update the indexes of Alpine's mirrors
 
     :returns: True when files have been downloaded, False otherwise
     """
@@ -187,7 +220,7 @@ def update(arch: Arch | None = None, force: bool = False, existing_only: bool = 
     # outdated_arches: ["armhf", "x86_64", ... ]
     outdated = {}
     outdated_arches: list[Arch] = []
-    for url in get_repos_from_config(None):
+    for url in get_repos_from_config(None, alpine_only=alpine_only):
         for architecture in architectures:
             # APKINDEX file name from the URL
             url_full = f"{url}/{architecture}/APKINDEX.tar.gz"
